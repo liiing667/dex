@@ -114,10 +114,10 @@ type Grant interface {
 	// resolves it and enforces the connector-authorization invariant (client
 	// allows it, connector allows the grant type) before Authorize. The grant may
 	// read it from the request or look it up in storage; returning an error
-	// rejects the request. Returning "" skips the step — for a grant that uses no
-	// connector (client_credentials, device_code), or one already authorized
-	// elsewhere (authorization_code was gated at /auth and resolves its connector
-	// inside Authorize only to decide on a refresh token).
+	// rejects the request. Returning "" skips the shared step — for a grant that
+	// uses no connector (client_credentials, device_code), or one authorized
+	// elsewhere and rechecked at its own redemption boundary
+	// (authorization_code is gated at /auth and rechecked in ExchangeAuthCode).
 	ConnectorID(ctx context.Context, req *Request, client storage.Client) (string, *oauth2.Error)
 	// Authorize proves the identity against conn (the zero Connector when
 	// ConnectorID is "") and produces the response to write. Standard grants build

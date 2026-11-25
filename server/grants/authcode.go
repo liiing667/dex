@@ -35,9 +35,10 @@ func (g *authorizationCode) ScopePolicy() ScopePolicy {
 	return ScopePolicy{}
 }
 
-// ConnectorID is empty: the connector is recorded on the stored auth code and
-// was already authorized at /auth. The grant resolves it (without re-running the
-// invariant) only to decide on a refresh token, inside ExchangeAuthCode.
+// ConnectorID is empty in the shared pipeline: the connector is recorded on the
+// stored auth code and was already authorized at /auth. ExchangeAuthCode
+// re-checks the client allow-list at redemption and resolves the connector to
+// decide whether a refresh token can be issued.
 func (g *authorizationCode) ConnectorID(ctx context.Context, req *Request, client storage.Client) (string, *oauth2.Error) {
 	return "", nil
 }
@@ -84,6 +85,20 @@ func (g *authorizationCode) Authorize(ctx context.Context, req *Request, client 
 // minting means a signing failure afterwards leaves the code spent, which is the
 // right trade: replay safety over a retry on a rare signer outage.
 func ExchangeAuthCode(ctx context.Context, s storage.Storage, conns *connectors.Cache, logger *slog.Logger, authCode storage.AuthCode, client storage.Client) (tokens.Authorization, bool, error) {
+	// Re-check the client's connector policy when the code is redeemed. The
+	// /auth and device browser paths enforce it before issuing the code, but the
+	// allow-list can be tightened during the code's short lifetime. Running this
+	// before DeleteAuthCode also leaves the code untouched on rejection.
+	if !connectors.ConnectorAllowed(client.AllowedConnectors, authCode.ConnectorID) {
+		logger.WarnContext(ctx, "connector not allowed for client",
+			"client_id", client.ID, "connector_id", authCode.ConnectorID)
+		return tokens.Authorization{}, false, &oauth2.Error{
+			Type:        oauth2.InvalidGrant,
+			Description: "Connector not allowed for this client.",
+			Status:      http.StatusBadRequest,
+		}
+	}
+
 	if err := s.DeleteAuthCode(ctx, authCode.ID); err != nil {
 		if err == storage.ErrNotFound {
 			return tokens.Authorization{}, false, &oauth2.Error{Type: oauth2.InvalidGrant, Description: "Invalid or expired code parameter.", Status: http.StatusBadRequest}

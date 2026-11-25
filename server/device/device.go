@@ -395,6 +395,10 @@ func (h *Handler) completeDeviceAuthorization(w http.ResponseWriter, r *http.Req
 	// what to issue; the tokens are minted here.
 	auth, withRefresh, err := grants.ExchangeAuthCode(ctx, h.Storage, h.Connectors, h.Logger, authCode, client)
 	if err != nil {
+		var oauthErr *oauth2.Error
+		if errors.As(err, &oauthErr) {
+			return "", oauth2FlowError(oauthErr)
+		}
 		h.Logger.ErrorContext(ctx, "could not exchange auth code for client", "client_id", deviceReq.ClientID, "err", err)
 		return "", &deviceFlowError{status: http.StatusInternalServerError, message: "Failed to exchange auth code."}
 	}
