@@ -66,6 +66,10 @@ func TestDeviceCallback(t *testing.T) {
 		testAuthCode           storage.AuthCode
 		testDeviceRequest      storage.DeviceRequest
 		testDeviceToken        storage.DeviceToken
+		// extraClients are created in addition to the default "testclient", so a
+		// rejection can be attributed to the client/redirect binding rather than
+		// to a missing client record.
+		extraClients []storage.Client
 	}{
 		{
 			testName: "Missing State",
@@ -156,7 +160,9 @@ func TestDeviceCallback(t *testing.T) {
 		{
 			// The device request names a different client than the auth code was
 			// minted for: the client/redirect binding must reject it (cross-client
-			// auth code injection guard) before any client lookup.
+			// auth code injection guard) before any client lookup. "otherclient"
+			// exists and authenticates, so the 400 must come from the binding
+			// check itself and not from a failed client lookup.
 			testName:     "Cross-client auth code injection",
 			values:       baseFormValues,
 			testAuthCode: baseAuthCode,
@@ -166,6 +172,13 @@ func TestDeviceCallback(t *testing.T) {
 				ClientID:   "otherclient",
 				Scopes:     []string{"openid", "profile", "email"},
 				Expiry:     now().Add(5 * time.Minute),
+			},
+			extraClients: []storage.Client{
+				{
+					ID:           "otherclient",
+					Secret:       "",
+					RedirectURIs: []string{oauth2.DeviceCallbackURI},
+				},
 			},
 			expectedResponseCode: http.StatusBadRequest,
 		},
@@ -200,6 +213,69 @@ func TestDeviceCallback(t *testing.T) {
 				Expiry:      now().Add(5 * time.Minute),
 			},
 			testDeviceRequest:    baseDeviceRequest,
+			expectedResponseCode: http.StatusBadRequest,
+		},
+		{
+			// A fragment can not spoof the callback path either: the fragment is
+			// never part of url.Parse's Path, so the suffix check rejects it.
+			testName: "Auth code redirect spoofed via fragment",
+			values:   baseFormValues,
+			testAuthCode: storage.AuthCode{
+				ID:          "somecode",
+				ClientID:    "testclient",
+				RedirectURI: "https://example.com/callback#/device/callback",
+				Scopes:      []string{"openid", "profile", "email"},
+				ConnectorID: "mock",
+				Expiry:      now().Add(5 * time.Minute),
+			},
+			testDeviceRequest:    baseDeviceRequest,
+			expectedResponseCode: http.StatusBadRequest,
+		},
+		{
+			// The real device flow stores the redirect under the issuer path (see
+			// verifyUserCode). The suffix match must accept this issuer-prefixed
+			// shape so a normal device-code exchange keeps working.
+			testName: "Issuer-prefixed device callback accepted",
+			values:   baseFormValues,
+			testAuthCode: storage.AuthCode{
+				ID:          "somecode",
+				ClientID:    "testclient",
+				RedirectURI: "https://example.com/non-root-path/device/callback",
+				Scopes:      []string{"openid", "profile", "email"},
+				ConnectorID: "mock",
+				Expiry:      now().Add(5 * time.Minute),
+			},
+			testDeviceRequest:    baseDeviceRequest,
+			testDeviceToken:      baseDeviceToken,
+			expectedResponseCode: http.StatusOK,
+		},
+		{
+			// Both guards together: a different client and a non-device redirect
+			// must be rejected even when each spoof is attempted at once.
+			testName: "Cross-client code with non-device redirect",
+			values:   baseFormValues,
+			testAuthCode: storage.AuthCode{
+				ID:          "somecode",
+				ClientID:    "testclient",
+				RedirectURI: "https://example.com/callback?next=/device/callback",
+				Scopes:      []string{"openid", "profile", "email"},
+				ConnectorID: "mock",
+				Expiry:      now().Add(5 * time.Minute),
+			},
+			testDeviceRequest: storage.DeviceRequest{
+				UserCode:   "XXXX-XXXX",
+				DeviceCode: "devicecode",
+				ClientID:   "otherclient",
+				Scopes:     []string{"openid", "profile", "email"},
+				Expiry:     now().Add(5 * time.Minute),
+			},
+			extraClients: []storage.Client{
+				{
+					ID:           "otherclient",
+					Secret:       "",
+					RedirectURIs: []string{oauth2.DeviceCallbackURI},
+				},
+			},
 			expectedResponseCode: http.StatusBadRequest,
 		},
 		{
@@ -296,6 +372,11 @@ func TestDeviceCallback(t *testing.T) {
 			}
 			if err := s.storage.CreateClient(ctx, client); err != nil {
 				t.Fatalf("failed to create client: %v", err)
+			}
+			for _, extra := range tc.extraClients {
+				if err := s.storage.CreateClient(ctx, extra); err != nil {
+					t.Fatalf("failed to create extra client %q: %v", extra.ID, err)
+				}
 			}
 
 			u, err := url.Parse(s.issuerURL.String())
