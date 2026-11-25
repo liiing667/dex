@@ -2,9 +2,11 @@ package authflow
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"time"
 
+	"github.com/dexidp/dex/server/useridentity"
 	"github.com/dexidp/dex/storage"
 )
 
@@ -59,6 +61,23 @@ func (h *Handler) trySessionLoginWithSession(ctx context.Context, r *http.Reques
 	ui, err := h.Storage.GetUserIdentity(ctx, session.UserID, session.ConnectorID)
 	if err != nil {
 		h.Logger.ErrorContext(ctx, "session: failed to get user identity", "err", err)
+		return false
+	}
+
+	// Enforce the account lock from the freshly read identity. A session cookie
+	// on a shared device outlives an admin block, so a session-based login must
+	// re-check the lock before marking a new AuthRequest logged in; otherwise a
+	// locked account keeps getting logged-in requests (and, via the dispatcher,
+	// tokens) for as long as its session remains valid.
+	if err := useridentity.EnsureNotLocked(ui, h.Now); err != nil {
+		var locked *useridentity.LockedError
+		if errors.As(err, &locked) {
+			h.Logger.WarnContext(ctx, "session: login rejected for locked account",
+				"user_id", session.UserID, "connector_id", session.ConnectorID,
+				"blocked_until", locked.Until)
+		} else {
+			h.Logger.ErrorContext(ctx, "session: failed to check account lock state", "err", err)
+		}
 		return false
 	}
 

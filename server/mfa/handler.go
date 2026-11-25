@@ -2,6 +2,7 @@ package mfa
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"github.com/dexidp/dex/server/oauth2"
 	"github.com/dexidp/dex/server/router"
 	"github.com/dexidp/dex/server/templates"
+	"github.com/dexidp/dex/server/useridentity"
 	"github.com/dexidp/dex/storage"
 )
 
@@ -82,6 +84,27 @@ func (h *Handler) validateMFARequest(w http.ResponseWriter, r *http.Request) (*m
 	identity, err := h.Storage.GetUserIdentity(ctx, authReq.Claims.UserID, authReq.ConnectorID)
 	if err != nil {
 		h.Logger.ErrorContext(ctx, "failed to get user identity", "err", err)
+		h.renderError(r, w, http.StatusInternalServerError, "Database error.")
+		return nil, false
+	}
+
+	// Enforce the account lock on every factor read. The AuthRequest was marked
+	// logged in at an earlier step; on a shared device the account can be blocked
+	// while that request (or an SSO session) is still in flight, and without a
+	// fresh check here the user could finish MFA and have MFAValidated set on a
+	// locked account. The decision is made from storage state on every request,
+	// so it stays consistent with the lock's current value.
+	if err := useridentity.EnsureNotLocked(identity, h.Now); err != nil {
+		var locked *useridentity.LockedError
+		if errors.As(err, &locked) {
+			h.Logger.WarnContext(ctx, "MFA rejected for locked account",
+				"connector_id", authReq.ConnectorID, "user_id", authReq.Claims.UserID,
+				"blocked_until", locked.Until)
+			h.renderError(r, w, http.StatusForbidden,
+				fmt.Sprintf("Account is locked until %s.", locked.Until.Format(time.RFC3339)))
+			return nil, false
+		}
+		h.Logger.ErrorContext(ctx, "failed to check account lock state", "err", err)
 		h.renderError(r, w, http.StatusInternalServerError, "Database error.")
 		return nil, false
 	}
@@ -210,6 +233,30 @@ func (h *Handler) handleMFA(w http.ResponseWriter, r *http.Request) {
 	}
 	if !internal.VerifyStep(authReq, r.FormValue("hmac"), internal.StepMFA) {
 		h.renderError(r, w, http.StatusUnauthorized, "Unauthorized request.")
+		return
+	}
+
+	// Re-read the identity and enforce the account lock here as well: the
+	// request may have been marked LoggedIn on a shared device before the
+	// account was blocked, and the entry is the first hop every factor reaches.
+	identity, err := h.Storage.GetUserIdentity(ctx, authReq.Claims.UserID, authReq.ConnectorID)
+	if err != nil {
+		h.Logger.ErrorContext(ctx, "failed to get user identity", "err", err)
+		h.renderError(r, w, http.StatusInternalServerError, "Database error.")
+		return
+	}
+	if err := useridentity.EnsureNotLocked(identity, h.Now); err != nil {
+		var locked *useridentity.LockedError
+		if errors.As(err, &locked) {
+			h.Logger.WarnContext(ctx, "MFA entry rejected for locked account",
+				"connector_id", authReq.ConnectorID, "user_id", authReq.Claims.UserID,
+				"blocked_until", locked.Until)
+			h.renderError(r, w, http.StatusForbidden,
+				fmt.Sprintf("Account is locked until %s.", locked.Until.Format(time.RFC3339)))
+			return
+		}
+		h.Logger.ErrorContext(ctx, "failed to check account lock state", "err", err)
+		h.renderError(r, w, http.StatusInternalServerError, "Database error.")
 		return
 	}
 

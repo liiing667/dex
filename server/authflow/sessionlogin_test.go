@@ -702,6 +702,64 @@ func setupSessionWithIdentity(t *testing.T, s *sessionTestServer, now time.Time,
 	return authReq
 }
 
+// TestTrySessionLogin_LockedAccount covers the shared-device case: a valid
+// session cookie is present but the account was blocked after the session was
+// established. Session-based login must re-check the lock from the freshly read
+// identity and refuse to mark the new AuthRequest logged in; once the block is
+// lifted the same session must log in normally again.
+func TestTrySessionLogin_LockedAccount(t *testing.T) {
+	ctx := t.Context()
+
+	t.Run("locked account is rejected without logging in", func(t *testing.T) {
+		s := newTestSessionServer(t)
+		s.SkipApproval = true
+		authReq := setupSessionLoginFixture(t, s)
+
+		require.NoError(t, s.Storage.UpdateUserIdentity(ctx, "user-1", "mock", func(u storage.UserIdentity) (storage.UserIdentity, error) {
+			u.BlockedUntil = s.Now().Add(time.Hour)
+			return u, nil
+		}))
+
+		r := sessionCookieRequest("test-nonce")
+		w := httptest.NewRecorder()
+
+		ok := s.trySessionLogin(ctx, r, w, &authReq)
+		assert.False(t, ok, "locked account must not complete session login")
+
+		updated, err := s.Storage.GetAuthRequest(ctx, authReq.ID)
+		require.NoError(t, err)
+		assert.False(t, updated.LoggedIn, "locked account must not be marked logged in")
+	})
+
+	t.Run("account works again after the block is lifted", func(t *testing.T) {
+		s := newTestSessionServer(t)
+		s.SkipApproval = true
+		authReq := setupSessionLoginFixture(t, s)
+
+		require.NoError(t, s.Storage.UpdateUserIdentity(ctx, "user-1", "mock", func(u storage.UserIdentity) (storage.UserIdentity, error) {
+			u.BlockedUntil = s.Now().Add(time.Hour)
+			return u, nil
+		}))
+
+		r := sessionCookieRequest("test-nonce")
+		w := httptest.NewRecorder()
+		require.False(t, s.trySessionLogin(ctx, r, w, &authReq))
+
+		require.NoError(t, s.Storage.UpdateUserIdentity(ctx, "user-1", "mock", func(u storage.UserIdentity) (storage.UserIdentity, error) {
+			u.BlockedUntil = time.Time{}
+			return u, nil
+		}))
+
+		r = sessionCookieRequest("test-nonce")
+		w = httptest.NewRecorder()
+		assert.True(t, s.trySessionLogin(ctx, r, w, &authReq), "normal account must still be able to log in")
+
+		updated, err := s.Storage.GetAuthRequest(ctx, authReq.ID)
+		require.NoError(t, err)
+		assert.True(t, updated.LoggedIn)
+	})
+}
+
 func TestTrySessionLogin_MaxAge(t *testing.T) {
 	ctx := t.Context()
 

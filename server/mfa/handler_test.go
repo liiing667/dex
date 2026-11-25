@@ -150,6 +150,16 @@ func TestMFAEntry(t *testing.T) {
 		}
 		require.NoError(t, store.CreateAuthRequest(ctx, authReq))
 		require.NoError(t, store.CreateClient(ctx, storage.Client{ID: "app", Secret: "s", MFAChain: []string{"totp"}}))
+		require.NoError(t, store.CreateUserIdentity(ctx, storage.UserIdentity{
+			UserID:              "user-1",
+			ConnectorID:         "mock",
+			Claims:              authReq.Claims,
+			Consents:            map[string][]string{},
+			MFASecrets:          map[string]*storage.MFASecret{},
+			WebAuthnCredentials: map[string][]storage.WebAuthnCredential{},
+			CreatedAt:           time.Now(),
+			LastLogin:           time.Now(),
+		}))
 		return router, store, authReq, hmacKey
 	}
 
@@ -183,4 +193,72 @@ func TestMFAEntry(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, updated.MFAValidated, "MFA must be marked satisfied so the dispatcher does not loop back to /mfa")
 	})
+}
+
+// TestMFARequestRejectsLockedAccount covers the shared-device lockout: the
+// AuthRequest was already marked LoggedIn at an earlier login step, but the
+// account is blocked while the request is still in flight. Every factor entry
+// re-reads the identity and must refuse before any MFA state can change, and
+// the request must go through again once the block is lifted.
+func TestMFARequestRejectsLockedAccount(t *testing.T) {
+	ctx := t.Context()
+
+	provider := NewTOTPProvider("test-issuer", nil)
+	_, router, store := newTestHandler(t,
+		map[string]Provider{"totp": provider},
+		[]string{"totp"},
+	)
+
+	hmacKey := randomHMACKey(t)
+	authReq := storage.AuthRequest{
+		ID:          "mfa-locked-req",
+		ClientID:    "example-app",
+		Expiry:      time.Now().Add(time.Hour),
+		HMACKey:     hmacKey,
+		LoggedIn:    true,
+		Claims:      storage.Claims{UserID: "user-1", Email: "user@example.com"},
+		ConnectorID: "mock",
+	}
+	require.NoError(t, store.CreateAuthRequest(ctx, authReq))
+	require.NoError(t, store.CreateClient(ctx, storage.Client{ID: "example-app", Secret: "secret"}))
+	require.NoError(t, store.CreateUserIdentity(ctx, storage.UserIdentity{
+		UserID:              "user-1",
+		ConnectorID:         "mock",
+		Claims:              authReq.Claims,
+		Consents:            map[string][]string{},
+		MFASecrets:          map[string]*storage.MFASecret{},
+		WebAuthnCredentials: map[string][]storage.WebAuthnCredential{},
+		CreatedAt:           time.Now(),
+		LastLogin:           time.Now(),
+		BlockedUntil:        time.Now().Add(time.Hour),
+	}))
+
+	hmacVal := internal.SignStep(authReq, internal.Authenticator("totp"))
+	target := "/mfa/totp?req=" + authReq.ID + "&hmac=" + hmacVal + "&authenticator=totp"
+
+	// Locked: the factor endpoint must refuse without touching MFA state.
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, target, nil))
+	require.Equal(t, http.StatusForbidden, rr.Code)
+	require.Contains(t, rr.Body.String(), "locked")
+
+	updated, err := store.GetAuthRequest(ctx, authReq.ID)
+	require.NoError(t, err)
+	require.False(t, updated.MFAValidated, "locked account must not be able to satisfy MFA")
+
+	// The /mfa entry shares the same validation path and must refuse as well.
+	entryHMAC := internal.SignStep(authReq, internal.StepMFA)
+	rr = httptest.NewRecorder()
+	router.ServeHTTP(rr, httptest.NewRequest(http.MethodGet,
+		"/mfa?req="+authReq.ID+"&hmac="+entryHMAC, nil))
+	require.Equal(t, http.StatusForbidden, rr.Code)
+
+	// Lift the block: the same request can now reach the factor page.
+	require.NoError(t, store.UpdateUserIdentity(ctx, "user-1", "mock", func(u storage.UserIdentity) (storage.UserIdentity, error) {
+		u.BlockedUntil = time.Time{}
+		return u, nil
+	}))
+	rr = httptest.NewRecorder()
+	router.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, target, nil))
+	require.Equal(t, http.StatusOK, rr.Code, "normal account must still be able to complete login")
 }

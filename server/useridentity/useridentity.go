@@ -25,6 +25,19 @@ func (e *LockedError) Error() string {
 	return fmt.Sprintf("account is locked until %s", e.Until.Format(time.RFC3339))
 }
 
+// EnsureNotLocked refuses when the identity's BlockedUntil is still in the
+// future. Every login path must enforce the account lock from the freshly read
+// identity, not just the one that first marks an AuthRequest logged in: on a
+// shared device an existing browser session or an in-flight auth request can
+// re-enter MFA or session-based login after the account was blocked. A zero or
+// past BlockedUntil means the account is usable.
+func EnsureNotLocked(identity storage.UserIdentity, now func() time.Time) error {
+	if !identity.BlockedUntil.IsZero() && now().Before(identity.BlockedUntil) {
+		return &LockedError{Until: identity.BlockedUntil}
+	}
+	return nil
+}
+
 // RecordLogin refuses to proceed for a locked account, then creates the
 // user's identity row on first login or refreshes its claims and last-login
 // time on later ones.
@@ -54,10 +67,13 @@ func RecordLogin(ctx context.Context, s storage.Storage, logger *slog.Logger, no
 		return fmt.Errorf("failed to look up user identity: %w", err)
 	}
 
-	if !stored.BlockedUntil.IsZero() && now().Before(stored.BlockedUntil) {
-		logger.WarnContext(ctx, "login rejected for locked account",
-			"connector_id", connectorID, "user_id", identity.UserID, "blocked_until", stored.BlockedUntil)
-		return &LockedError{Until: stored.BlockedUntil}
+	if err := EnsureNotLocked(stored, now); err != nil {
+		var locked *LockedError
+		if errors.As(err, &locked) {
+			logger.WarnContext(ctx, "login rejected for locked account",
+				"connector_id", connectorID, "user_id", identity.UserID, "blocked_until", locked.Until)
+		}
+		return err
 	}
 
 	if err := s.UpdateUserIdentity(ctx, identity.UserID, connectorID, func(old storage.UserIdentity) (storage.UserIdentity, error) {
