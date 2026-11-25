@@ -607,8 +607,40 @@ func verifyError(ctx context.Context, msg string, err error) error {
 	return err
 }
 
+// mergeUserInfoClaims merges the claims returned by the UserInfo endpoint into
+// the claims asserted by the ID Token. OpenID Connect Core 5.3.2 requires the
+// UserInfo sub to match the ID Token sub, so a verified ID Token's subject is
+// authoritative and is never replaced by the UserInfo response.
+func mergeUserInfoClaims(claims, userInfoClaims map[string]interface{}, idTokenSubject string, hasIDToken bool) error {
+	if hasIDToken {
+		if rawSub, ok := userInfoClaims["sub"]; ok {
+			userInfoSubject, ok := rawSub.(string)
+			if !ok {
+				return fmt.Errorf("oidc: userinfo sub %v does not match id_token sub %q", rawSub, idTokenSubject)
+			}
+			if userInfoSubject != idTokenSubject {
+				return fmt.Errorf("oidc: userinfo sub %q does not match id_token sub %q", userInfoSubject, idTokenSubject)
+			}
+		}
+	}
+
+	for k, v := range userInfoClaims {
+		// The subject is established by the verified ID Token. Keep it even if
+		// the UserInfo response repeats the same value.
+		if hasIDToken && k == "sub" {
+			continue
+		}
+		claims[k] = v
+	}
+	return nil
+}
+
 func (c *oidcConnector) createIdentity(ctx context.Context, identity connector.Identity, token *oauth2.Token, caller caller) (connector.Identity, error) {
-	var claims map[string]interface{}
+	var (
+		claims         map[string]interface{}
+		idTokenSubject string
+		hasIDToken     bool
+	)
 
 	if rawIDToken, ok := token.Extra("id_token").(string); ok {
 		idToken, err := c.verifier.Verify(ctx, rawIDToken)
@@ -619,6 +651,7 @@ func (c *oidcConnector) createIdentity(ctx context.Context, identity connector.I
 		if err := idToken.Claims(&claims); err != nil {
 			return identity, fmt.Errorf("oidc: failed to decode claims: %v", err)
 		}
+		hasIDToken = true
 	} else if caller == exchangeCaller {
 		switch token.TokenType {
 		case "urn:ietf:params:oauth:token-type:id_token":
@@ -630,6 +663,7 @@ func (c *oidcConnector) createIdentity(ctx context.Context, identity connector.I
 			if err := idToken.Claims(&claims); err != nil {
 				return identity, fmt.Errorf("oidc: failed to decode claims: %v", err)
 			}
+			hasIDToken = true
 		case "urn:ietf:params:oauth:token-type:access_token":
 			if !c.getUserInfo {
 				return identity, fmt.Errorf("oidc: getUserInfo is required for access token exchange")
@@ -643,7 +677,12 @@ func (c *oidcConnector) createIdentity(ctx context.Context, identity connector.I
 	}
 
 	// Keep the verified ID Token subject to compare against the userinfo response below.
-	idTokenSubject, _ := claims["sub"].(string)
+	if hasIDToken {
+		idTokenSubject, _ = claims["sub"].(string)
+		if idTokenSubject == "" {
+			return identity, errors.New("oidc: missing \"sub\" claim in ID Token")
+		}
+	}
 
 	// We immediately want to run getUserInfo if configured before we validate the claims.
 	// For token exchanges with access tokens, this is how we verify the token.
@@ -655,13 +694,17 @@ func (c *oidcConnector) createIdentity(ctx context.Context, identity connector.I
 		if err != nil {
 			return identity, fmt.Errorf("oidc: error loading userinfo: %v", err)
 		}
-		if err := userInfo.Claims(&claims); err != nil {
+
+		userInfoClaims := make(map[string]interface{})
+		if err := userInfo.Claims(&userInfoClaims); err != nil {
 			return identity, fmt.Errorf("oidc: failed to decode userinfo claims: %v", err)
 		}
 
-		// The userinfo sub must match the ID Token sub (OpenID Connect Core 5.3.2).
-		if userInfoSubject, _ := claims["sub"].(string); idTokenSubject != "" && userInfoSubject != idTokenSubject {
-			return identity, fmt.Errorf("oidc: userinfo sub %q does not match id_token sub %q", userInfoSubject, idTokenSubject)
+		if claims == nil {
+			claims = make(map[string]interface{})
+		}
+		if err := mergeUserInfoClaims(claims, userInfoClaims, idTokenSubject, hasIDToken); err != nil {
+			return identity, err
 		}
 	}
 

@@ -1559,6 +1559,82 @@ func TestHandleCallbackUserInfoSubMatch(t *testing.T) {
 	}
 }
 
+func TestMergeUserInfoClaims(t *testing.T) {
+	tests := []struct {
+		name           string
+		idTokenClaims  map[string]interface{}
+		userInfoClaims map[string]interface{}
+		idTokenSubject string
+		hasIDToken     bool
+		wantErr        bool
+		wantSub        string
+		wantName       string
+	}{
+		{
+			name:           "userinfo supplements matching subject",
+			idTokenClaims:  map[string]interface{}{"sub": "subvalue"},
+			userInfoClaims: map[string]interface{}{"sub": "subvalue", "name": "namevalue"},
+			idTokenSubject: "subvalue",
+			hasIDToken:     true,
+			wantSub:        "subvalue",
+			wantName:       "namevalue",
+		},
+		{
+			name:           "userinfo without sub supplements id token claims",
+			idTokenClaims:  map[string]interface{}{"sub": "subvalue"},
+			userInfoClaims: map[string]interface{}{"name": "namevalue"},
+			idTokenSubject: "subvalue",
+			hasIDToken:     true,
+			wantSub:        "subvalue",
+			wantName:       "namevalue",
+		},
+		{
+			name:           "userinfo sub mismatch is rejected",
+			idTokenClaims:  map[string]interface{}{"sub": "subvalue"},
+			userInfoClaims: map[string]interface{}{"sub": "other-subvalue"},
+			idTokenSubject: "subvalue",
+			hasIDToken:     true,
+			wantErr:        true,
+		},
+		{
+			name:           "non-string userinfo sub is rejected",
+			idTokenClaims:  map[string]interface{}{"sub": "subvalue"},
+			userInfoClaims: map[string]interface{}{"sub": 123},
+			idTokenSubject: "subvalue",
+			hasIDToken:     true,
+			wantErr:        true,
+		},
+		{
+			name:           "userinfo cannot supply a subject missing from the id token",
+			idTokenClaims:  map[string]interface{}{},
+			userInfoClaims: map[string]interface{}{"sub": "subvalue"},
+			hasIDToken:     true,
+			wantErr:        true,
+		},
+		{
+			name:           "userinfo is the subject when there is no id token",
+			idTokenClaims:  map[string]interface{}{},
+			userInfoClaims: map[string]interface{}{"sub": "subvalue", "name": "namevalue"},
+			hasIDToken:     false,
+			wantSub:        "subvalue",
+			wantName:       "namevalue",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := mergeUserInfoClaims(tc.idTokenClaims, tc.userInfoClaims, tc.idTokenSubject, tc.hasIDToken)
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.wantSub, tc.idTokenClaims["sub"])
+			require.Equal(t, tc.wantName, tc.idTokenClaims["name"])
+		})
+	}
+}
+
 func TestTokenIdentityKeysUnavailable(t *testing.T) {
 	backend, err := setupServer(map[string]any{
 		"sub":  "subvalue",
