@@ -633,6 +633,14 @@ func TestValidRedirectURI(t *testing.T) {
 			redirectURI: "http://localhost",
 			wantValid:   false,
 		},
+		{
+			client: storage.Client{
+				Public:       true,
+				RedirectURIs: []string{"http://foo.com/bar"},
+			},
+			redirectURI: "http://127.0.0.1:991/bar",
+			wantValid:   false,
+		},
 		// These special desktop + device + localhost URIs can still be specified explicitly.
 		{
 			client: storage.Client{
@@ -672,6 +680,14 @@ func TestValidRedirectURI(t *testing.T) {
 				RedirectURIs: []string{"http://foo.com/bar", "http://localhost"},
 			},
 			redirectURI: "http://localhost",
+			wantValid:   true,
+		},
+		{
+			client: storage.Client{
+				Public:       true,
+				RedirectURIs: []string{"http://foo.com/bar", "http://127.0.0.1:991/bar"},
+			},
+			redirectURI: "http://127.0.0.1:991/bar",
 			wantValid:   true,
 		},
 		// Non-localhost URIs are not allowed implicitly.

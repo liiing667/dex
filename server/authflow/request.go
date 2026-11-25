@@ -86,15 +86,19 @@ func (h *Handler) redirectWithError(w http.ResponseWriter, r *http.Request, auth
 }
 
 func validateRedirectURI(client storage.Client, redirectURI string) bool {
-	// Allow named RedirectURIs for both public and non-public clients.
-	// This is required to make PKCE-enabled web apps work when configured as public clients.
-	for _, uri := range client.RedirectURIs {
-		if redirectURI == uri {
-			return true
-		}
+	// A client that registered redirect URIs -- public or confidential -- may
+	// only use one of those exact values. In particular, a public client with
+	// its own registered URIs must not implicitly gain the desktop/device
+	// redirects below just because it is public. Explicitly registered special
+	// URIs still match here, which is what keeps native and device clients
+	// working when they declare them.
+	if len(client.RedirectURIs) > 0 {
+		return slices.Contains(client.RedirectURIs, redirectURI)
 	}
-	// For non-public clients or when RedirectURIs is set, we allow only explicitly named RedirectURIs.
-	if !client.Public || len(client.RedirectURIs) > 0 {
+
+	// Only public clients without a registered set get the legacy implicit
+	// redirects: out-of-band, the device callback, and loopback HTTP.
+	if !client.Public {
 		return false
 	}
 
@@ -211,7 +215,12 @@ func (h *Handler) parseAuthorizationRequest(r *http.Request) (*storage.AuthReque
 	}
 
 	validRedirect := validateRedirectURI(client, redirectURI)
-	// The device flow sends its callback under the issuer path; public clients may allow it as the bare path.
+	// The device flow sends its callback under the issuer path. A public client
+	// may register the bare callback path instead, but this only translates an
+	// already-authorized bare path: validateRedirectURI still requires the bare
+	// path to be in the client's registered set (or the client to have no
+	// registered URIs at all). It cannot grant access to an unregistered
+	// callback.
 	if !validRedirect && client.Public && redirectURI == h.IssuerURL.AbsPath(oauth2.DeviceCallbackURI) {
 		validRedirect = validateRedirectURI(client, oauth2.DeviceCallbackURI)
 	}

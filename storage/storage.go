@@ -168,7 +168,9 @@ type Client struct {
 	SecretEnv string `json:"secretEnv"`
 
 	// A registered set of redirect URIs. When redirecting from dex to the client, the URI
-	// requested to redirect to MUST match one of these values, unless the client is "public".
+	// requested to redirect to MUST match one of these values exactly. A public client
+	// with an empty set may also use the legacy loopback, out-of-band, and device
+	// callbacks; registering any URI disables that implicit fallback.
 	RedirectURIs []string `json:"redirectURIs"`
 
 	// PostLogoutRedirectURIs is a registered set of URIs that the client can redirect to
@@ -192,7 +194,9 @@ type Client struct {
 	// Clients inherently trust themselves.
 	TrustedPeers []string `json:"trustedPeers"`
 
-	// Public clients must use either use a redirectURL 127.0.0.1:X or "urn:ietf:wg:oauth:2.0:oob"
+	// Public clients without registered redirect URIs may use a loopback redirect,
+	// "urn:ietf:wg:oauth:2.0:oob", or the device callback. Registering redirect URIs
+	// restricts a public client to those exact values.
 	Public bool `json:"public"`
 
 	// Name and LogoURL used when displaying this client to the end user.
