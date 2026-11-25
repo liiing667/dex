@@ -2,9 +2,11 @@ package authflow
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"time"
 
+	sessionmanager "github.com/dexidp/dex/server/session"
 	"github.com/dexidp/dex/storage"
 )
 
@@ -35,6 +37,9 @@ func (h *Handler) trySessionLoginWithSession(ctx context.Context, r *http.Reques
 		// Create a new client state for the target client via SSO. It carries the
 		// source's authentication time: the user did not authenticate again here.
 		if err := h.Storage.UpdateAuthSession(ctx, session.ID, func(old storage.AuthSession) (storage.AuthSession, error) {
+			if !h.Sessions.RequestCookieMatches(r, old) {
+				return old, sessionmanager.ErrCookieSuperseded
+			}
 			if old.ClientStates == nil {
 				old.ClientStates = make(map[string]*storage.ClientAuthState)
 			}
@@ -101,8 +106,13 @@ func (h *Handler) finishSessionLogin(ctx context.Context, r *http.Request, w htt
 		return false
 	}
 
-	// Update session activity.
-	_ = h.Storage.UpdateAuthSession(ctx, session.ID, func(old storage.AuthSession) (storage.AuthSession, error) {
+	// Update session activity. The cookie is proved again against the current
+	// record so a replacement/rotation that raced the earlier validation cannot
+	// be refreshed by the stale request.
+	touchErr := h.Storage.UpdateAuthSession(ctx, session.ID, func(old storage.AuthSession) (storage.AuthSession, error) {
+		if !h.Sessions.RequestCookieMatches(r, old) {
+			return old, sessionmanager.ErrCookieSuperseded
+		}
 		old.LastActivity = now
 		old.IdleExpiry = h.Sessions.IdleExpiry(now)
 		if cs, ok := old.ClientStates[authReq.ClientID]; ok {
@@ -110,6 +120,11 @@ func (h *Handler) finishSessionLogin(ctx context.Context, r *http.Request, w htt
 		}
 		return old, nil
 	})
+	if errors.Is(touchErr, sessionmanager.ErrCookieSuperseded) {
+		h.Logger.WarnContext(ctx, "session login cookie was superseded",
+			"session_id", session.ID, "client_id", authReq.ClientID)
+		return false
+	}
 
 	// Re-read to get the updated AuthRequest (LoggedIn, Claims, ConnectorID set above),
 	// then let the shared decision pick the next step.

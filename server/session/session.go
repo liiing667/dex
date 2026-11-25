@@ -41,6 +41,11 @@ type Manager struct {
 // Enabled reports whether sessions are configured.
 func (m *Manager) Enabled() bool { return m.Config != nil }
 
+// ErrCookieSuperseded is returned when a request cookie no longer proves the
+// stored session. This happens after the session secret was rotated or the
+// browser was issued a replacement cookie.
+var ErrCookieSuperseded = errors.New("session cookie is superseded")
+
 // RememberMeDefault reports the configured default for the remember-me choice,
 // or nil when sessions are disabled. The password form renders it as the
 // checkbox's initial state; callers that need a plain bool (connector callbacks,
@@ -101,6 +106,22 @@ func (m *Manager) ClearCookie(w http.ResponseWriter) {
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   -1,
 	})
+}
+
+// RequestCookieMatches atomically compares the cookie carried by r with a
+// session value read inside a storage update. The comparison is deliberately
+// performed from the updater's current record rather than a session loaded
+// earlier: a cookie replaced between the two reads must not refresh the record
+// that replaced it.
+func (m *Manager) RequestCookieMatches(r *http.Request, current storage.AuthSession) bool {
+	if m == nil {
+		return false
+	}
+	sessionID, secret, ok := m.ParseCookie(r)
+	if !ok || sessionID != current.ID {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(current.Secret), []byte(secret)) == 1
 }
 
 // expiryReason names why a session is over, or "" while it is still live.
@@ -320,6 +341,9 @@ func (m *Manager) ClientSharesWith(sourceClient storage.Client, targetClientID s
 // so the GetClient calls below are not redundant.
 func (m *Manager) FindSSO(ctx context.Context, session *storage.AuthSession, targetClientID string) *storage.ClientAuthState {
 	for sourceClientID, state := range session.ClientStates {
+		if state == nil {
+			continue
+		}
 		// Only directly-authenticated states may act as SSO sources. Skipping
 		// SSO-derived states keeps sharing unidirectional and prevents transitive
 		// A->B->C chains (a user authenticated only to A must not be SSO'd into C
@@ -360,8 +384,8 @@ func (m *Manager) UpdateTokenIssuedAt(r *http.Request, clientID string) {
 	_ = m.Storage.UpdateAuthSession(r.Context(), sessionID, func(old storage.AuthSession) (storage.AuthSession, error) {
 		// Prove the cookie as every other session-trusting path does: a stale one
 		// must not refresh a live session's idle timeout. Aborting leaves it untouched.
-		if subtle.ConstantTimeCompare([]byte(old.Secret), []byte(secret)) != 1 {
-			return old, errors.New("session secret mismatch")
+		if sessionID != old.ID || subtle.ConstantTimeCompare([]byte(old.Secret), []byte(secret)) != 1 {
+			return old, ErrCookieSuperseded
 		}
 		old.LastActivity = now
 		old.IdleExpiry = now.Add(m.Config.ValidIfNotUsedFor)
