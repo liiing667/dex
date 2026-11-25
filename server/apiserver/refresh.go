@@ -28,6 +28,9 @@ func (d dexAPI) ListRefresh(ctx context.Context, req *api.ListRefreshReq) (*api.
 
 	refreshTokenRefs := make([]*api.RefreshTokenRef, 0, len(offlineSessions.Refresh))
 	for _, session := range offlineSessions.Refresh {
+		if session == nil {
+			continue
+		}
 		r := api.RefreshTokenRef{
 			Id:        session.ID,
 			ClientId:  session.ClientID,

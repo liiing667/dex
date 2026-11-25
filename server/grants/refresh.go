@@ -348,6 +348,13 @@ func rotateError(err error) *oauth2.Error {
 	if upstreamRejected(err) {
 		return &oauth2.Error{Type: oauth2.InvalidGrant, Description: "The upstream identity provider rejected the refresh token.", Status: http.StatusBadRequest}
 	}
+	// The token was valid when the request started but was revoked, replaced,
+	// or lost its offline-session reference while the rotation was in flight.
+	// That is a rejected token, not a server fault; RFC 6749 section 5.2 uses
+	// invalid_grant for a refresh token that is "invalid, expired, revoked".
+	if errors.Is(err, tokens.ErrRefreshTokenInvalid) {
+		return &oauth2.Error{Type: oauth2.InvalidGrant, Description: "Refresh token is invalid or has already been claimed by another client.", Status: http.StatusBadRequest}
+	}
 	return &oauth2.Error{Type: oauth2.InvalidRequest, Status: http.StatusInternalServerError}
 }
 

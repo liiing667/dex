@@ -217,6 +217,54 @@ func (f *failingOfflineSessionStorage) UpdateOfflineSessions(ctx context.Context
 	return f.Storage.UpdateOfflineSessions(ctx, userID, connID, updater)
 }
 
+// blockingOfflineUpdateStorage parks the first UpdateOfflineSessions call, the
+// offline-session update of an in-flight rotation, until released. Later calls
+// pass through so a concurrent revocation can complete while the rotation is
+// parked.
+type blockingOfflineUpdateStorage struct {
+	storage.Storage
+	inUpdate chan struct{}
+	release  chan struct{}
+	updates  atomic.Int32
+}
+
+func (b *blockingOfflineUpdateStorage) UpdateOfflineSessions(ctx context.Context, userID, connID string, updater func(s storage.OfflineSessions) (storage.OfflineSessions, error)) error {
+	if b.updates.Add(1) == 1 {
+		close(b.inUpdate)
+		<-b.release
+	}
+	return b.Storage.UpdateOfflineSessions(ctx, userID, connID, updater)
+}
+
+// zeroValueOnMissingStorage mirrors the etcd backend, which invokes a token
+// updater with the zero value when the key is gone and writes the result back
+// unless the updater returns an error.
+type zeroValueOnMissingStorage struct {
+	storage.Storage
+}
+
+func (z zeroValueOnMissingStorage) UpdateRefreshToken(ctx context.Context, id string, updater func(r storage.RefreshToken) (storage.RefreshToken, error)) error {
+	token, err := z.Storage.GetRefresh(ctx, id)
+	if errors.Is(err, storage.ErrNotFound) {
+		updated, uerr := updater(storage.RefreshToken{})
+		if uerr != nil {
+			return uerr
+		}
+		return z.Storage.CreateRefresh(ctx, updated)
+	}
+	if err != nil {
+		return err
+	}
+
+	updated, err := updater(token)
+	if err != nil {
+		return err
+	}
+	return z.Storage.UpdateRefreshToken(ctx, id, func(storage.RefreshToken) (storage.RefreshToken, error) {
+		return updated, nil
+	})
+}
+
 func TestRefreshStoreRotateConcurrentRefreshReusesClaimedToken(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()
@@ -610,4 +658,183 @@ func TestRefreshStoreUpdateOfflineSessionAfterRevoke(t *testing.T) {
 		err = rt.updateOfflineSession(ctx, &stored, connector.Identity{UserID: "u1"}, time.Now())
 	})
 	require.Error(t, err)
+}
+
+// TestRefreshStoreRotateRevokedDuringRotation revokes the token after it has
+// been claimed and finalized but before the offline session is updated. The
+// rotation must fail as a rejected token instead of panicking on the reference
+// that the revocation removed, and the revoked token must stay gone.
+func TestRefreshStoreRotateRevokedDuringRotation(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+	clock := func() time.Time { return now }
+
+	blocked := &blockingOfflineUpdateStorage{
+		Storage:  memory.New(slog.New(slog.DiscardHandler)),
+		inUpdate: make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+	rt := NewRefreshStore(blocked, clock, slog.New(slog.DiscardHandler))
+	seedRefreshToken(t, blocked.Storage, now.Add(-time.Minute))
+	strategy := NewRefreshStrategy(true, 0, 0, 0, clock)
+
+	stored, err := blocked.GetRefresh(ctx, "r1")
+	require.NoError(t, err)
+
+	fresh := func(context.Context) (connector.Identity, error) {
+		return connector.Identity{UserID: "u1", Username: "bob"}, nil
+	}
+
+	var rotateErr error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _, rotateErr = rt.Rotate(ctx, &stored, &internal.RefreshToken{RefreshId: "r1", Token: "t1"}, strategy, fresh)
+	}()
+
+	select {
+	case <-blocked.inUpdate:
+	case <-time.After(5 * time.Second):
+		t.Fatal("rotation never reached the offline session update")
+	}
+
+	// Revoke while the rotation is parked just before updating the session.
+	rt.RevokeClients(ctx, "u1", "mock", []string{"client-1"})
+	close(blocked.release)
+	<-done
+
+	require.ErrorIs(t, rotateErr, ErrRefreshTokenInvalid)
+
+	_, err = blocked.GetRefresh(ctx, "r1")
+	require.ErrorIs(t, err, storage.ErrNotFound, "the revoked token must not be resurrected")
+
+	session, err := blocked.GetOfflineSessions(ctx, "u1", "mock")
+	require.NoError(t, err)
+	require.NotContains(t, session.Refresh, "client-1")
+}
+
+// TestRefreshStoreRotateRevokedBeforeClaimOnUpsertStorage covers a backend that
+// calls the updater with a zero token when the row is gone. A revoked token
+// must be rejected, not written back as a new row.
+func TestRefreshStoreRotateRevokedBeforeClaimOnUpsertStorage(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+	clock := func() time.Time { return now }
+
+	base := memory.New(slog.New(slog.DiscardHandler))
+	store := zeroValueOnMissingStorage{Storage: base}
+	rt := NewRefreshStore(store, clock, slog.New(slog.DiscardHandler))
+	seedRefreshToken(t, base, now.Add(-time.Minute))
+	strategy := NewRefreshStrategy(true, 0, 0, 0, clock)
+
+	stored, err := base.GetRefresh(ctx, "r1")
+	require.NoError(t, err)
+
+	// Revoke before the claim, as another request would.
+	rt.RevokeClients(ctx, "u1", "mock", []string{"client-1"})
+
+	fresh := func(context.Context) (connector.Identity, error) {
+		return connector.Identity{UserID: "u1", Username: "bob"}, nil
+	}
+	_, _, err = rt.Rotate(ctx, &stored, &internal.RefreshToken{RefreshId: "r1", Token: "t1"}, strategy, fresh)
+	require.ErrorIs(t, err, ErrRefreshTokenInvalid)
+
+	_, err = base.GetRefresh(ctx, "r1")
+	require.ErrorIs(t, err, storage.ErrNotFound, "a revoked token must not be recreated")
+}
+
+// TestRefreshStoreRotateOfflineSessionDeletedDuringRotation deletes the whole
+// offline session while a rotation is in flight. The update must fail as a
+// rejected token rather than panicking, and the claim is rolled back because no
+// offline session exists to record it.
+func TestRefreshStoreRotateOfflineSessionDeletedDuringRotation(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+	clock := func() time.Time { return now }
+
+	blocked := &blockingOfflineUpdateStorage{
+		Storage:  memory.New(slog.New(slog.DiscardHandler)),
+		inUpdate: make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+	rt := NewRefreshStore(blocked, clock, slog.New(slog.DiscardHandler))
+	seedRefreshToken(t, blocked.Storage, now.Add(-time.Minute))
+	strategy := NewRefreshStrategy(true, 0, 0, 0, clock)
+
+	stored, err := blocked.GetRefresh(ctx, "r1")
+	require.NoError(t, err)
+
+	fresh := func(context.Context) (connector.Identity, error) {
+		return connector.Identity{UserID: "u1", Username: "bob"}, nil
+	}
+
+	var rotateErr error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _, rotateErr = rt.Rotate(ctx, &stored, &internal.RefreshToken{RefreshId: "r1", Token: "t1"}, strategy, fresh)
+	}()
+
+	select {
+	case <-blocked.inUpdate:
+	case <-time.After(5 * time.Second):
+		t.Fatal("rotation never reached the offline session update")
+	}
+
+	require.NoError(t, blocked.DeleteOfflineSessions(ctx, "u1", "mock"))
+	close(blocked.release)
+	<-done
+
+	require.ErrorIs(t, rotateErr, ErrRefreshTokenInvalid)
+
+	// The claim is undone, so the client keeps the token it already holds even
+	// though the offline session is gone.
+	after, err := blocked.GetRefresh(ctx, "r1")
+	require.NoError(t, err)
+	require.Equal(t, "t1", after.Token)
+	require.Equal(t, "t0", after.ObsoleteToken)
+}
+
+// TestRefreshStoreUpdateOfflineSessionNilRefreshMap covers a session whose
+// references were cleared by a storage backend that returns a nil map. Looking
+// up the missing reference must fail, not panic.
+func TestRefreshStoreUpdateOfflineSessionNilRefreshMap(t *testing.T) {
+	ctx := context.Background()
+	rt, store := newTestStore(t)
+
+	stored := storage.RefreshToken{
+		ID: "r1", Token: "t1", ClientID: "client-1", ConnectorID: "mock",
+		Claims: storage.Claims{UserID: "u1"}, CreatedAt: time.Now(), LastUsed: time.Now(),
+	}
+	require.NoError(t, store.CreateRefresh(ctx, stored))
+	require.NoError(t, store.CreateOfflineSessions(ctx, storage.OfflineSessions{
+		UserID: "u1", ConnID: "mock",
+	}))
+
+	require.NotPanics(t, func() {
+		err := rt.updateOfflineSession(ctx, &stored, connector.Identity{UserID: "u1"}, time.Now())
+		require.ErrorIs(t, err, ErrRefreshTokenInvalid)
+	})
+}
+
+// TestRefreshStoreCreateWithNilRefreshMap ensures an existing session returned
+// with a nil reference map is initialized instead of panicking on assignment.
+func TestRefreshStoreCreateWithNilRefreshMap(t *testing.T) {
+	ctx := context.Background()
+	rt, store := newTestStore(t)
+
+	require.NoError(t, store.CreateOfflineSessions(ctx, storage.OfflineSessions{
+		UserID: "u1", ConnID: "mock",
+	}))
+
+	raw, err := rt.Create(ctx, testAuthorization())
+	require.NoError(t, err)
+
+	var tok internal.RefreshToken
+	require.NoError(t, internal.Unmarshal(raw, &tok))
+
+	session, err := store.GetOfflineSessions(ctx, "u1", "mock")
+	require.NoError(t, err)
+	require.Contains(t, session.Refresh, "client-1")
+	require.Equal(t, tok.RefreshId, session.Refresh["client-1"].ID)
 }

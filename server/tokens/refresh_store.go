@@ -86,13 +86,21 @@ func (rt *RefreshStore) Create(ctx context.Context, auth Authorization) (string,
 		}
 	default:
 		// Replace any existing refresh token for this client.
-		if oldRef, ok := session.Refresh[tokenRef.ClientID]; ok {
+		if oldRef, ok := session.Refresh[tokenRef.ClientID]; ok && oldRef != nil && oldRef.ID != "" {
 			if err := rt.storage.DeleteRefresh(ctx, oldRef.ID); err != nil && err != storage.ErrNotFound {
 				rollback()
 				return "", fmt.Errorf("delete previous refresh token: %w", err)
 			}
 		}
 		if err := rt.storage.UpdateOfflineSessions(ctx, session.UserID, session.ConnID, func(old storage.OfflineSessions) (storage.OfflineSessions, error) {
+			if old.UserID != session.UserID || old.ConnID != session.ConnID {
+				// The session was deleted after it was read. Do not recreate
+				// it from the zero value a backend may hand us.
+				return old, storage.ErrNotFound
+			}
+			if old.Refresh == nil {
+				old.Refresh = make(map[string]*storage.RefreshTokenRef)
+			}
 			old.Refresh[tokenRef.ClientID] = &tokenRef
 			if len(auth.ConnectorData) > 0 {
 				old.ConnectorData = auth.ConnectorData
@@ -162,6 +170,13 @@ func (rt *RefreshStore) Rotate(ctx context.Context, storageToken *storage.Refres
 		// on conflict) must not carry a stale decision from an earlier run.
 		mint = false
 
+		// Some backends hand an updater the zero value when the row is
+		// missing instead of returning ErrNotFound. Never treat that as a
+		// live token: writing it back would recreate a revoked token.
+		if old.ID != storageToken.ID {
+			return old, fmt.Errorf("%w: refresh token no longer exists", ErrRefreshTokenInvalid)
+		}
+
 		rotationEnabled := strategy.RotationEnabled()
 		reusingAllowed := strategy.AllowedToReuse(old.LastUsed)
 
@@ -173,7 +188,7 @@ func (rt *RefreshStore) Rotate(ctx context.Context, storageToken *storage.Refres
 
 		case rotationEnabled && reusingAllowed:
 			if old.Token != requestToken.Token && old.ObsoleteToken != requestToken.Token {
-				return old, errors.New("refresh token claimed twice")
+				return old, fmt.Errorf("%w: refresh token claimed twice", ErrRefreshTokenInvalid)
 			}
 
 			// Return the previously generated token for requests carrying an obsolete one.
@@ -188,7 +203,7 @@ func (rt *RefreshStore) Rotate(ctx context.Context, storageToken *storage.Refres
 
 		case rotationEnabled && !reusingAllowed:
 			if old.Token != requestToken.Token {
-				return old, errors.New("refresh token claimed twice")
+				return old, fmt.Errorf("%w: refresh token claimed twice", ErrRefreshTokenInvalid)
 			}
 		}
 
@@ -209,6 +224,11 @@ func (rt *RefreshStore) Rotate(ctx context.Context, storageToken *storage.Refres
 
 	if err := rt.storage.UpdateRefreshToken(ctx, storageToken.ID, claim); err != nil {
 		rt.logger.ErrorContext(ctx, "failed to claim refresh token rotation", "err", err)
+		if errors.Is(err, storage.ErrNotFound) {
+			// The token was revoked after the caller loaded it but before the
+			// claim. That is a rejected token, not a storage fault.
+			return "", ident, fmt.Errorf("%w: %w", ErrRefreshTokenInvalid, err)
+		}
 		return "", ident, err
 	}
 
@@ -266,6 +286,11 @@ func (rt *RefreshStore) Rotate(ctx context.Context, storageToken *storage.Refres
 // an undo that itself fails is logged and otherwise ignored.
 func (rt *RefreshStore) undoClaim(ctx context.Context, id string, rotate bool, mintedToken, prevObsolete string, lastUsed, claimedFrom time.Time) {
 	err := rt.storage.UpdateRefreshToken(ctx, id, func(old storage.RefreshToken) (storage.RefreshToken, error) {
+		if old.ID != id {
+			// The row is gone, for example because it was revoked while the
+			// rotation was in flight. Do not write the zero value back.
+			return old, storage.ErrNotFound
+		}
 		if old.Token != mintedToken || old.LastUsed.Before(lastUsed) {
 			return old, nil
 		}
@@ -287,7 +312,11 @@ func (rt *RefreshStore) updateOfflineSession(ctx context.Context, refresh *stora
 	offlineSessionUpdater := func(old storage.OfflineSessions) (storage.OfflineSessions, error) {
 		ref := old.Refresh[refresh.ClientID]
 		if ref == nil || ref.ID != refresh.ID {
-			return old, errors.New("refresh token invalid")
+			// Another request revoked the token, or replaced its reference,
+			// between the claim and this update. There is nothing left to
+			// update, so fail the rotation instead of dereferencing a
+			// reference that is no longer there.
+			return old, fmt.Errorf("%w: refresh token invalid", ErrRefreshTokenInvalid)
 		}
 
 		ref.LastUsed = lastUsed
@@ -301,6 +330,12 @@ func (rt *RefreshStore) updateOfflineSession(ctx context.Context, refresh *stora
 
 	if err := rt.storage.UpdateOfflineSessions(ctx, refresh.Claims.UserID, refresh.ConnectorID, offlineSessionUpdater); err != nil {
 		rt.logger.ErrorContext(ctx, "failed to update offline session", "err", err)
+		if errors.Is(err, storage.ErrNotFound) {
+			// The whole offline session was deleted (for example by a purge)
+			// while the rotation was in flight. The token cannot be used any
+			// more, but this is not a server failure.
+			return fmt.Errorf("%w: %w", ErrRefreshTokenInvalid, err)
+		}
 		return err
 	}
 
@@ -355,7 +390,7 @@ func (rt *RefreshStore) revoke(ctx context.Context, userID, connectorID string, 
 
 	tokenIDs := make(map[string]struct{}, len(offlineSessions.Refresh))
 	for clientID, ref := range offlineSessions.Refresh {
-		if match(clientID) {
+		if match(clientID) && ref != nil && ref.ID != "" {
 			tokenIDs[ref.ID] = struct{}{}
 		}
 	}
@@ -365,7 +400,15 @@ func (rt *RefreshStore) revoke(ctx context.Context, userID, connectorID string, 
 	}
 
 	if err := rt.storage.UpdateOfflineSessions(ctx, userID, connectorID, func(old storage.OfflineSessions) (storage.OfflineSessions, error) {
+		if old.UserID != userID || old.ConnID != connectorID {
+			// The session is gone; do not let a backend recreate it from the
+			// zero value while we are only trying to remove references.
+			return old, storage.ErrNotFound
+		}
 		for clientID, ref := range old.Refresh {
+			if ref == nil {
+				continue
+			}
 			if _, ok := tokenIDs[ref.ID]; ok {
 				delete(old.Refresh, clientID)
 			}
