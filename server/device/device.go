@@ -151,7 +151,9 @@ func (h *Handler) parseDeviceCodeRequest(r *http.Request) (deviceCodeRequest, *d
 		scopes = []string{"openid"}
 	}
 
-	clientID, clientSecret, oerr := grants.ClientCredentials(r, r.Form)
+	// Client credentials come from the Authorization header when present,
+	// otherwise the POST body, matching the token endpoint (grants.parseRequest).
+	clientID, clientSecret, oerr := grants.ClientCredentials(r, r.PostForm)
 	if oerr != nil {
 		return deviceCodeRequest{}, oauth2FlowError(oerr)
 	}

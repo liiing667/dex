@@ -33,6 +33,12 @@ func ClientCredentials(r *http.Request, form url.Values) (id, secret string, oer
 // AuthenticateClient looks the client up and checks its secret in constant time.
 // A client with an empty secret authenticates without one.
 func AuthenticateClient(ctx context.Context, s storage.Storage, logger *slog.Logger, id, secret string) (storage.Client, *oauth2.Error) {
+	// An empty client ID cannot name a registered client. Reject it explicitly
+	// rather than relying on the storage backend to return ErrNotFound.
+	if id == "" {
+		return storage.Client{}, &oauth2.Error{Type: oauth2.InvalidClient, Description: "Invalid client credentials.", Status: http.StatusUnauthorized}
+	}
+
 	client, err := s.GetClient(ctx, id)
 	if err != nil {
 		if err != storage.ErrNotFound {
