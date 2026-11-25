@@ -142,8 +142,10 @@ func ClaimsFromIdentity(identity connector.Identity) storage.Claims {
 // claim reuses the token or rotates it, the finalize writes the refreshed claims.
 // The updaters never read storage, so backends that serialize on one connection
 // or lock (SQLite, memory) cannot deadlock. A concurrent refresh that lands
-// between the two reuses the new token. A failed resolve, finalize or offline
-// session update undoes the claim.
+// between the two reuses the new token. A failed resolve or finalize undoes
+// the minted claim. A failed offline session update does the same only when
+// this call minted a token; a reuse claim must leave the token that may
+// already have been returned to the client untouched.
 func (rt *RefreshStore) Rotate(ctx context.Context, storageToken *storage.RefreshToken, requestToken *internal.RefreshToken, strategy *RefreshStrategy, freshIdentity func(context.Context) (connector.Identity, error)) (string, connector.Identity, error) {
 	newToken := &internal.RefreshToken{
 		Token:     requestToken.Token,
@@ -247,6 +249,8 @@ func (rt *RefreshStore) Rotate(ctx context.Context, storageToken *storage.Refres
 	}
 
 	if err := rt.updateOfflineSession(ctx, storageToken, ident, lastUsed); err != nil {
+		// Only a minted claim is compensated. On the reuse path the row may
+		// already hold a token returned to another in-flight request.
 		if mint {
 			rt.undoClaim(ctx, storageToken.ID, strategy.RotationEnabled(), newToken.Token, prevObsolete, lastUsed, claimedFrom)
 		}
